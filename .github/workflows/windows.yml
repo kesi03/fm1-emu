@@ -1,0 +1,93 @@
+name: Windows Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+  pull_request:
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  workspace-build:
+    name: Build Workspace
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Workspace
+        run: cargo build --release
+
+      - name: Collect Workspace Artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts
+
+          Get-ChildItem target/release -File -ErrorAction SilentlyContinue |
+          Where-Object {
+            $_.Extension -eq ".exe" -or
+            $_.Extension -eq ".dll"
+          } |
+          Copy-Item -Destination artifacts
+
+      - name: Upload Workspace Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-windows
+          path: artifacts
+
+  plugin-build:
+    name: Build Plugin
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        working-directory: crates/fm1-plugin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Plugin
+        run: cargo build --release
+
+      - name: Collect Plugin Files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force plugin-artifacts
+
+          Get-ChildItem -Recurse target/release -ErrorAction SilentlyContinue |
+          Where-Object {
+            $_.Extension -eq ".dll" -or
+            $_.Extension -eq ".clap"
+          } |
+          Copy-Item -Destination plugin-artifacts -Force
+
+      - name: Upload Plugin Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-windows
+          path: crates/fm1-plugin/plugin-artifacts
