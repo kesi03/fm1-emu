@@ -1,13 +1,6 @@
-name: Windows Build
+name: Manual Windows Build
 
 on:
-  push:
-    branches:
-      - main
-      - master
-
-  pull_request:
-
   workflow_dispatch:
 
 permissions:
@@ -18,12 +11,13 @@ env:
 
 jobs:
 
-  workspace-build:
-    name: Build Workspace
+  build:
+    name: Build FM1 Windows
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Install Rust
@@ -31,63 +25,149 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+
+      ####################################################################
+      # Build main workspace
+      ####################################################################
 
       - name: Build Workspace
         run: cargo build --release
 
-      - name: Collect Workspace Artifacts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force artifacts
+      ####################################################################
+      # Build plugin workspace
+      ####################################################################
 
-          Get-ChildItem target/release -File -ErrorAction SilentlyContinue |
-          Where-Object {
-            $_.Extension -eq ".exe" -or
-            $_.Extension -eq ".dll"
-          } |
-          Copy-Item -Destination artifacts
-
-      - name: Upload Workspace Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: workspace-windows
-          path: artifacts
-
-  plugin-build:
-    name: Build Plugin
-    runs-on: windows-latest
-
-    defaults:
-      run:
+      - name: Build Plugin Workspace
         working-directory: crates/fm1-plugin
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build Plugin
         run: cargo build --release
 
-      - name: Collect Plugin Files
+      ####################################################################
+      # Show outputs
+      ####################################################################
+
+      - name: Dump Build Outputs
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force plugin-artifacts
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "EXE FILES"
+          Write-Host "=============================="
+          Get-ChildItem -Recurse -Filter *.exe -ErrorAction SilentlyContinue
 
-          Get-ChildItem -Recurse target/release -ErrorAction SilentlyContinue |
-          Where-Object {
-            $_.Extension -eq ".dll" -or
-            $_.Extension -eq ".clap"
-          } |
-          Copy-Item -Destination plugin-artifacts -Force
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "DLL FILES"
+          Write-Host "=============================="
+          Get-ChildItem -Recurse -Filter *.dll -ErrorAction SilentlyContinue
 
-      - name: Upload Plugin Artifacts
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "CLAP FILES"
+          Write-Host "=============================="
+          Get-ChildItem -Recurse -Filter *.clap -ErrorAction SilentlyContinue
+
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "VST3 FILES"
+          Write-Host "=============================="
+          Get-ChildItem -Recurse -Filter *.vst3 -ErrorAction SilentlyContinue
+
+      ####################################################################
+      # Validate VST3
+      ####################################################################
+
+      - name: Validate VST3 Package Structure
+        shell: pwsh
+        run: |
+          $vst3s = Get-ChildItem -Recurse -Filter *.vst3 -ErrorAction SilentlyContinue
+
+          if ($vst3s.Count -eq 0) {
+            Write-Warning "No VST3 bundle found."
+            exit 0
+          }
+
+          foreach ($bundle in $vst3s) {
+
+            Write-Host ""
+            Write-Host "Checking: $($bundle.FullName)"
+
+            $binaries = Get-ChildItem `
+              -Path $bundle.FullName `
+              -Recurse `
+              -Include *.dll,*.vst3 `
+              -ErrorAction SilentlyContinue
+
+            if ($binaries.Count -eq 0) {
+              throw "Invalid VST3 bundle: no binary found"
+            }
+
+            foreach ($file in $binaries) {
+
+              $sizeKB = :Round($file.Length / 1KB, 2)
+
+              Write-Host "Binary: $($file.Name)"
+              Write-Host "Size: $sizeKB KB"
+
+              if ($file.Length -lt 50000) {
+                throw "Binary appears suspiciously small"
+              }
+            }
+          }
+
+      ####################################################################
+      # Gather release files
+      ####################################################################
+
+      - name: Collect Build Artifacts
+        shell: pwsh
+        run: |
+          New-Item `
+            -ItemType Directory `
+            -Path artifacts `
+            -Force | Out-Null
+
+          Get-ChildItem `
+            -Recurse `
+            -Include *.exe,*.dll,*.vst3,*.clap `
+            -ErrorAction SilentlyContinue |
+          ForEach-Object {
+
+            $destination = Join-Path artifacts $_.Name
+
+            Copy-Item `
+              $_.FullName `
+              $destination `
+              -Force
+          }
+
+      ####################################################################
+      # Create ZIP
+      ####################################################################
+
+      - name: Create Release ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path artifacts\* `
+            -DestinationPath fm1-windows-build.zip `
+            -Force
+
+      ####################################################################
+      # Upload ZIP
+      ####################################################################
+
+      - name: Upload ZIP Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: plugin-windows
-          path: crates/fm1-plugin/plugin-artifacts
+          name: fm1-windows-build
+          path: fm1-windows-build.zip
+
+      ####################################################################
+      # Upload raw files too
+      ####################################################################
+
+      - name: Upload Raw Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm1-raw-files
+          path: artifacts
