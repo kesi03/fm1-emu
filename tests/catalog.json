@@ -2,7 +2,7 @@
  "386dx": {
   "package": "97dc787a7b5ef405",
   "bytes": 1384448,
-  "audio": "5e5fc0393c935028"
+  "audio": "e515c1e4d69004cc"
  },
  "amb": {
   "package": "59dbc6b688e3a64b",
@@ -143,6 +143,11 @@
   "package": "2339bd6438ed23fa",
   "bytes": 1363968,
   "audio": "556512248d64563c"
+ },
+ "fm1dock": {
+  "package": "1f4d8774833634d7",
+  "bytes": 1378304,
+  "audio": "e2b8634937e94665"
  },
  "fm1doom": {
   "package": "6e23e322d16923e8",
@@ -365,9 +370,9 @@
   "audio": "f3e5456ffd709998"
  },
  "sid": {
-  "package": "f4a07dce2d5fa9d0",
-  "bytes": 1344000,
-  "audio": "91b669a548ca380d"
+  "package": "e59a9e478dd45bd3",
+  "bytes": 1378304,
+  "audio": "b8747c47661ce694"
  },
  "sid1": {
   "package": "4ee3dbe2079ea066",

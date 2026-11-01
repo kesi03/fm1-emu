@@ -30,9 +30,12 @@ fetched that way, so download `FM-1.fwsc` from M-VAVE and open it on the page.
 And the **[M-VAVE SMK-37](https://joakimeriksson.github.io/fm1-emu/smk37/)**: a 37-key keyboard with
 the FM-1's chip inside, whose community ports run here too ([below](#the-smk-37)).
 
-Also here: **[FM-1 SID](fm1-sid/)**, a firmware that turns the FM-1 into a Commodore 64 SID
+Also here: **[FM-1 SID](https://github.com/joakimeriksson/fm1-sid)** (`fm1-sid/`, a submodule: clone with
+`--recurse-submodules`), a firmware that turns the FM-1 into a Commodore 64 SID
 synth, with a step sequencer and stereo chorus, delay and reverb, that also plays C64 tunes
-([its page](https://joakimeriksson.github.io/fm1-emu/fm1-sid/) plays all of HVSC).
+and GoatTracker songs ([its page](https://joakimeriksson.github.io/fm1-emu/fm1-sid/) plays all of HVSC).
+On a real FM-1 it is its own firmware on [fm1-dock](https://github.com/joakimeriksson/fm1-dock), which
+keeps USB, the installers and the rescue.
 
 ## What runs
 
@@ -43,6 +46,14 @@ M-VAVE's stock firmware (V13 and V15) with both CPU cores running. The ones the 
 are our own list, `web/firmwares-own.json`: add a firmware there, and the tool appends it. Each
 name below opens the page with that firmware picked; press Start. (`?fw=` takes the Hub's ids
 too; `&embed=1` shows only the device and its controls, for a window on another site.)
+A page on this site can hand the emulator a try-out (`web/tryout.js`): `&flash=PATH` lays flash
+sectors over the package's fresh flash (records of a 4-byte little-endian offset and the 4096-byte
+sector, as the saves keep them), `&script=PATH` plays an input script from the boot (fm1-live's
+`FM1_BENCH_KEYS`: `ms:mHEX` MIDI into the DIN jack, `ms:id` keys, `ms:eN:clicks` encoders). Both
+come from the page's own origin only, the try-out starts by itself where the browser lets it, and
+it is a session of its own: the browser's saved flash is neither loaded nor overwritten. fm1-dock's
+catalog uses it for its "Try it": a module installed and picked
+([fm1-dock's tools/tryit.py](https://github.com/joakimeriksson/fm1-dock/blob/main/tools/tryit.py)).
 
 <!-- firmwares: node tools/readme_firmwares.mjs -->
 | Firmware (opens it on the page) | By | What it is |
@@ -77,6 +88,7 @@ too; `&embed=1` shows only the device and its controls, for a window on another 
 | [FiMba-1 0.6.1](https://joakimeriksson.github.io/fm1-emu/?fw=fimba) | [jadamsowers](https://github.com/jadamsowers/fm1-fimba) | A physically modelled kalimba (thumb piano), with mbira patterns, tape and grains. |
 | [Flyfish 1.0.1-4e5efb8](https://joakimeriksson.github.io/fm1-emu/?fw=flyfish) | [delirioux](https://github.com/delirioux/flyfish) | One piece on the FM-1: Chopin's Étude Op. |
 | [FM-106 Beta4](https://joakimeriksson.github.io/fm1-emu/?fw=fm106) | [PatttF](https://github.com/PatttF/fm-106) | The Juno-106 emulation of KR-106 ported to the FM-1: six voices on both cores, the BBD stereo chorus, 128 factory presets and a 1980s Roland look. |
+| [fm1-dock 0.7](https://joakimeriksson.github.io/fm1-emu/?fw=fm1dock) | [joakimeriksson](https://github.com/joakimeriksson/fm1-dock) | One firmware, many synths: CS-1, Scintilla and OberVave as modules in flash, the sine built in; HOME opens the picker. |
 | [FM-1 Doom 0.5](https://joakimeriksson.github.io/fm1-emu/?fw=fm1doom) | [zvenson](https://github.com/zvenson/fm1doom) | Doom on the FM-1: one arena from FreeDM, played on the keys and a knob, on the FM-1's screen, with synthesised sound effects and no music. |
 | [FM1-GM 1.0.2](https://joakimeriksson.github.io/fm1-emu/?fw=fm1gm) | [jartificer](https://github.com/jartificer/fm1-gm) | A General MIDI sequencer with 16 tracks, 128 General MIDI instruments to choose from and a drum kit (on track 10). |
 | [FMEL-1 1.0](https://joakimeriksson.github.io/fm1-emu/?fw=fmel) | [Antonio Altea](https://github.com/AntonioAltea/fmel-1) | Mellotron-style tape sounds, coloured with effects and lo-fi tape: flutes, strings and choirs as on the old tape frames, played from the keys. |
@@ -121,7 +133,7 @@ too; `&embed=1` shows only the device and its controls, for a window on another 
 | [FM1 Quest 38](https://joakimeriksson.github.io/fm1-emu/?fw=quest) | [hericdk](https://github.com/hericdk/fm1-quest) | A live RPG adventure inside the synth. |
 | [Rainbow Mode 1.1.5-rb](https://joakimeriksson.github.io/fm1-emu/?fw=rainbow) | [joshbartlettband-web](https://github.com/joshbartlettband-web/felucca-rainbow) | A music toy for little hands (a Felucca fork). |
 | [Shine On 3.0.1](https://joakimeriksson.github.io/fm1-emu/?fw=shineon) | [zvenson](https://github.com/zvenson/shineon) | A string ensemble in the spirit of the late-70s machines, grown out of OberVave: divide-down keyers with 16', 8' and 4' footages, register filters, a three-tap BBD ensemble and a phaser, on two tracks with the sequencer. |
-| [FM-1 SID 0.1](https://joakimeriksson.github.io/fm1-emu/?fw=sid) | [joakimeriksson](https://github.com/joakimeriksson/fm1-emu/tree/master/fm1-sid) | A SID chip on the FM-1, as a synth: the keys play 12 instruments, KNOB1-4 are cutoff, resonance, attack, release; FX opens chorus, delay and reverb. |
+| [FM-1 SID 0.3](https://joakimeriksson.github.io/fm1-emu/?fw=sid) | [joakimeriksson](https://github.com/joakimeriksson/fm1-sid) | A SID chip on the FM-1, its own firmware on fm1-dock (fm1-dock's USB, installer and rescue; the sine as the fallback): a C64 tune player (reSID 0.16 and a 6510 running the tune's own code, PSID and RSID) starting with GoatTracker 2's example songs, Dojo first; a GoatTracker editor; and a synth: the keys play 12 instruments, KNOB1-4 are cutoff, resonance, attack, release; FX opens chorus, delay and reverb. |
 | [SID-1 1.0.0](https://joakimeriksson.github.io/fm1-emu/?fw=sid1) | [putchdev](https://github.com/putchdev/sid-1) | The Commodore 64's SID chip, twice for six voices. |
 | [SIDOU 0.3.1](https://joakimeriksson.github.io/fm1-emu/?fw=sidou) | [Denis Sablić](https://github.com/dsablic/sidou) | Turns the FM-1 into a C64 SID machine: two SIDs (6581 and 8580) with the chip's character dialled in, a GoatTracker 2 compatible tracker and step sequencer, and a live instrument to play over a song. |
 | [Skiff 1.4](https://joakimeriksson.github.io/fm1-emu/?fw=skiff) | [illuminus5](https://github.com/illuminus5/skiff) | A six-track groovebox built on Felucca 1.1.5: fourteen synth and drum engines, a 64-step sequencer with chords, ratchets and locks, songs and a performance layer. |
@@ -161,8 +173,9 @@ identity says which board it runs on.
 **Play it: [joakimeriksson.github.io/fm1-emu/smk37](https://joakimeriksson.github.io/fm1-emu/smk37/)**.
 The firmwares come from [genkigenki's install page](https://genkigenki.github.io/smk37/)
 (`node tools/smk37_catalog.mjs` refreshes the list). M-VAVE's own SMK-37 firmware runs as the
-MIDI controller it is (screen, buttons, pads, keys; it names the chord you hold), without sound (its
-notes go to USB / Bluetooth MIDI) and slower than real time in the browser so far.
+MIDI controller it is (screen, buttons, pads, keys; it names the chord you hold): with PATCH on, the
+keys play its DX7 synth from this emulator's own bank (the factory patches are not in the package; the
+notes also go to USB / Bluetooth MIDI), slower than real time in the browser so far.
 
 <!-- smk37-firmwares: node tools/readme_firmwares.mjs -->
 | Firmware (opens it on the page) | By | What it is |
@@ -197,8 +210,8 @@ cargo run --release -p fm1-live -- --fw felucca         # a window with the synt
 cargo run --release -p fm1-live -- --fwsc FM-1.fwsc     # M-VAVE's own, from its package
 ```
 
-`fm1-live` compiles the firmware to native code on Apple silicon Macs, on Linux (ARM64 and
-x86-64) and on Windows (x86-64), and runs the real 240 MHz clock with it; elsewhere (Intel Macs) it interprets
+`fm1-live` compiles the firmware to native code on Macs (Apple silicon and Intel), on Linux (ARM64
+and x86-64) and on Windows (x86-64), and runs the real 240 MHz clock with it; elsewhere it interprets
 (`--mhz` lowers the clock if that can't keep up). It plays every MIDI input of the computer (`--midi NAME`, `--midi none`,
 `--midi-ch N`) and loads a DX7 bank into M-VAVE's firmware with `--syx bank.syx`.
 `fm1-emu` is the batch runner for tests and debugging (WAV and screen output, breakpoints,
@@ -217,6 +230,21 @@ firmwares that poll it (Felucca's family) enumerate, M-VAVE's own (interrupt-dri
 `FM1_USB_SEND='MS:HEX;…'` sends MIDI over USB at those times and prints what comes back
 (`FM1_USB_TRACE`: the bus's transactions; `FM1_USB_SIE_NS`: the controller's register access time,
 an estimate, 1 µs by default).
+USB audio: with `FM1_USB_WAV=FILE` (`--bench` or `--shot`) the host also records the firmware's
+USB audio input as a computer's recording program would: it chooses the audio streaming
+interface's setting that has the isochronous endpoint, asks for `FM1_USB_RATE` (44100 by
+default) if the endpoint can be set to it and the format offers it (else the device's own rate),
+takes one packet a millisecond and writes the samples to FILE (16-bit, interleaved as the device's
+channels come, no header), printing how many packets came empty (nothing queued: an underrun).
+Realistic mode: by default the emulator is generous where an FM-1 is not, so firmwares boot and
+play as they always have here. `FM1_STRICT=1` (fm1-live) runs it as an FM-1 is: a misaligned 16- or
+32-bit RAM access faults, each instruction takes its measured cycles (both cores, the flash
+cache's misses, the HW DSP / EQ / SRC units' jobs), and the LCD's transfers take their time at
+the SPI clock (a 240 x 240 frame ~77 ms at 12 MHz), so a firmware whose main loop waits for whole
+frames gets as little done in between as on the device; it interprets, without the JIT, so it
+is slower. `FM1_LCD_TIMED=1` (fm1-live, fm1-emu) times the LCD alone; `FM1_LCD_INSTANT=1` keeps it
+instant under `FM1_STRICT`. A firmware that boots under it boots later (its first frames take
+their time). `fm1-live --shot` then reports the LCD's share of the run.
 
 The page builds with `web/build.sh` (Rust to WebAssembly; needs the `wasm32-unknown-unknown`
 target), the whole site with `tools/build_site.sh`.
@@ -241,8 +269,9 @@ other synth:
   page's, played with the mouse: keys, buttons, knobs, and on the SMK-37 the pads, faders and
   wheels.
 - **Automation:** *Master* (the MASTER pot) is a parameter the DAW can automate.
-- **CPU clock:** the emulated clock, 240 MHz as on the chip by default; 320 or 400 give a
-  firmware that runs out of time more, at the cost of more of the computer's CPU.
+- **CPU clock:** the emulated clock, 240 MHz as on the chip by default. 120 or 160 let a heavy
+  firmware keep up on a slower computer; 320 or 400 give a firmware that runs out of time more,
+  at the cost of more of the computer's CPU.
 - **Share setups with the browser or another DAW.** “Load firmware / save…” opens a `.fwsc`
   package or `.fm1save` setup. “Export save…” writes the firmware and its latest saved patches
   and settings to one portable file. Edits in RAM need the firmware’s own Save command first.
@@ -253,10 +282,11 @@ other synth:
   how much faster than real time the firmware could run on this computer; most run at 3–6x,
   the heaviest at about 1.5x.
 
-**Download it** from [the releases](https://github.com/joakimeriksson/fm1-emu/releases/latest),
-for Macs with Apple silicon (M1 or later). The zip has the three plugins and an `INSTALL.txt` that
-says where each goes. Until a release is signed with an Apple Developer ID, macOS blocks it until
-you allow it, with one Terminal command that `INSTALL.txt` gives.
+**Download it** from [the releases](https://github.com/joakimeriksson/fm1-emu/releases/latest):
+a zip for Macs with Apple silicon (M1 or later; AU, VST3 and CLAP) and one for Windows (x86-64;
+VST3 and CLAP). Each has an `INSTALL.txt` that says where the files go. Until a release is signed
+with an Apple Developer ID, macOS blocks it until you allow it, with one Terminal command that
+`INSTALL.txt` gives; the Windows build is unsigned too, and Windows hosts load it as it is.
 
 **Build and install it yourself (macOS, Apple silicon).** You need Rust, CMake and Ninja
 (`brew install cmake ninja`), then:
@@ -267,6 +297,18 @@ tools/build_plugin.sh
 
 This builds the plugin and installs `FM-1.component`, `FM-1.vst3` and `FM-1.clap` in
 `~/Library/Audio/Plug-Ins`. It then runs Apple's AU validator on them.
+
+**Build and install it yourself (Windows, x86-64).** You need Rust (MSVC), Visual Studio Build
+Tools with the C++ workload, CMake and git, then:
+
+```powershell
+tools\build_plugin.ps1
+```
+
+This builds `FM-1.vst3` and `FM-1.clap` and installs them in `%LOCALAPPDATA%\Programs\Common`
+(`VST3` and `CLAP`). The two go together: the VST3 loads the CLAP from the CLAP folder.
+[crates/fm1-plugin](crates/fm1-plugin/README.md) has the details, and where to put them for a
+DAW that only scans `C:\Program Files\Common Files`.
 
 **In GarageBand:**
 1. *Settings → Audio/MIDI*: tick *Enable Audio Units*, then quit and reopen GarageBand.
@@ -279,6 +321,25 @@ This builds the plugin and installs `FM-1.component`, `FM-1.vst3` and `FM-1.clap
 
 **In VST3 or CLAP hosts:** add *FM-1* (by fm1-emu) as an instrument on a track.
 
+**On Windows, in Waveform Free** (REAPER works the same way; both find the plugin in
+`Common Files` and in the per-user folders, where the release's `INSTALL.txt` and
+`tools\build_plugin.ps1` put it):
+
+[![Three FM-1 tracks in Waveform Free on Windows: a Scintilla pad, a Felucca bass and lead](docs/media/plugin-windows-waveform.gif)](docs/media/plugin-windows-waveform.gif)
+
+1. *Track → Create New Track*, then the **+** at the right end of the track: *Plugins → fm1-emu → FM-1*.
+2. Click the *FM-1* box on the track to open its window, then *Load firmware / save…* and pick a
+   `.fwsc` package.
+3. Play it from a MIDI keyboard, or click the panel's keys. A MIDI clip on the track plays it too.
+
+The clip above is three tracks at 100 BPM, each with its own FM-1: a pad on
+[Scintilla](https://github.com/joakimeriksson/scintilla-fm1) (an Elka Synthex; preset 29,
+*Filtered strings*), then a bass and a lead joining on Felucca (*Analog Acid* and *FM6 Tine
+EP*). Each window's status bar shows the headroom: on a laptop each instance could run at about
+3x real time with all three playing, 4.5x idle. FM-1 Dock, which runs both of the chip's cores, is the
+heaviest: under real time on that laptop even at 120 MHz, so a synth it carries as a module is
+lighter as its own firmware, as Scintilla is here.
+
 **How it's built:** it's one plugin written in Rust as a CLAP with
 [nih-plug](https://github.com/robbert-vdh/nih-plug). [clap-wrapper](https://github.com/free-audio/clap-wrapper)
 makes the AU and VST3 of it, and the plugin stays MIT. All its parts are MIT, ISC or Apache-2.0,
@@ -290,7 +351,8 @@ including Apple's AudioUnitSDK and Steinberg's VST3 SDK, which is MIT since 3.8.
 - GarageBand, as an AU;
 - Steinberg's VST3 test host.
 
-Logic, Ableton and the Windows / Linux builds haven't been tried yet. More in
+On Windows the VST3 passes Steinberg's validator too (47 of 47) and plays in REAPER and
+Waveform Free. Logic, Ableton and the Linux build haven't been tried yet. More in
 [crates/fm1-plugin](crates/fm1-plugin/README.md).
 
 ## How it works
@@ -303,7 +365,8 @@ toolchain. On top of the CPU sit models of the chip's timers, interrupts, flash,
 Hot code is compiled, to AArch64 natively and to WebAssembly in the browser.
 How it was built and checked, step by step, is told in a technical report:
 [Emulating a Synthesizer Before It Arrives](https://joakimeriksson.github.io/fm1-emu/fm1-emu-report.pdf)
-(PDF, 8 pages).
+(PDF, 12 pages), with a section on the real FM-1: what releasing FM-1 SID before it ran on one cost
+its first users, the rounds that made it work there, and what fm1-dock's probes measured on the chip.
 
 - `crates/`: `fm1-isa` (decoder tables), `fm1-core` (CPU and JITs), `fm1-soc` (the chip and
   the board), `fm1-live` (the native synth), `fm1-emu` (batch runner), `fm1-web` (the wasm
@@ -312,15 +375,20 @@ How it was built and checked, step by step, is told in a technical report:
 - `docs/`: the hardware notes (`recon.md`), the instruction set (`isa-notes.md`), M-VAVE's
   firmware (`stock-firmware.md`); `PLAN.md` is the work log
 - `tools/`, `probes/`: ISA extraction, benchmarks, differential test programs
-- `fm1-sid/`: the SID study and player firmware (its own README)
+- `fm1-sid/`: the SID study and player firmware, [joakimeriksson/fm1-sid](https://github.com/joakimeriksson/fm1-sid) as a submodule
+  (its own README; `git submodule update --init` after a plain clone)
 
 ## Licences
 
 The emulator is MIT (`LICENSE`). The firmwares are their authors' and are not part of this
-repository; the page fetches them from the authors' sites. `fm1-sid/` has files under other
-licences, among them its player firmware, GPL-3.0 since it is built on Felucca's code:
-its README lists them. The plugin (`crates/fm1-plugin`) is MIT too; the libraries and SDKs it
-builds with are MIT, ISC or Apache-2.0.
+repository; the page fetches them from the authors' sites. `fm1-sid/` (its own repository) has
+files under other licences, among them its player firmware, GPL-3.0 since it is built on
+Felucca's code: its LICENSING.md lists them. The plugin (`crates/fm1-plugin`) is MIT too; the libraries and SDKs it
+builds with are permissive: MIT, ISC, Apache-2.0, BSD, Zlib, BSL-1.0, Unicode-3.0 and Unlicense, egui's built-in
+fonts OFL-1.1 and the Ubuntu font licence, and Steinberg's VST3 SDK (3.8, through clap-wrapper) MIT. nih-plug is built
+without its VST3 bindings, which are GPL. What the emulator emulates it learned from the chips' behaviour, the
+community's reverse engineering and the firmwares' own sources as references; no GPL code is in this repository
+(the test probe `probes/x0x/d909.c` builds X0X's GPL drum against it from a checkout outside it).
 
 ## Credits
 

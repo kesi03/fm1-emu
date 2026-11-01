@@ -4,7 +4,7 @@
 //! that is the host's "Master" parameter), and a bar to load a firmware package.
 
 use crate::engine::Cmd;
-use crate::{panel, panel_smk, Fm1Params, Link};
+use crate::{panel, panel_smk, Clock, Fm1Params, Link};
 use fm1_soc::Board;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets};
@@ -93,7 +93,7 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
                 if let Some(result) = ui.job.as_ref().and_then(|job| job.lock().unwrap().take()) {
                     ui.job = None;
                     ui.msg_until = result.as_ref().ok().map(|_| std::time::Instant::now() + std::time::Duration::from_secs(3));
-                    ui.msg = match result { Ok(message) => message, Err(error) => format!("Save file: {error}") };
+                    ui.msg = match result { Ok(message) => message, Err(error) => error };
                 }
                 let name = params.firmware.lock().unwrap().name.clone();
                 let idle = ui.picking.is_none() && ui.job.is_none();
@@ -120,8 +120,18 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
                 bar.separator();
                 bar.label("MIDI channel");
                 bar.add(widgets::ParamSlider::for_param(&params.channel, setter).with_width(90.0));
-                bar.label("CPU clock").on_hover_text("The emulated FM-1's clock, 240 MHz as on the chip. Raise it if a firmware runs out of time; each step costs this computer's CPU. Changing it restarts the firmware");
-                bar.add(widgets::ParamSlider::for_param(&params.clock, setter).with_width(90.0));
+                bar.label("CPU clock").on_hover_text("The emulated FM-1's clock, 240 MHz as on the chip. Lower it if this computer can't keep up with a heavy firmware (\"frames late\"); raise it if a firmware runs out of time. Changing it restarts the firmware");
+                // a menu in the clocks' order (the parameter's own order keeps v0.2.0's projects)
+                let now = params.clock.value();
+                egui::ComboBox::from_id_salt("clock").width(90.0).selected_text(now.name()).show_ui(bar, |menu| {
+                    for c in Clock::ALL {
+                        if menu.selectable_label(c == now, c.name()).clicked() && c != now {
+                            setter.begin_set_parameter(&params.clock);
+                            setter.set_parameter(&params.clock, c);
+                            setter.end_set_parameter(&params.clock);
+                        }
+                    }
+                });
                 bar.separator();
                 let status = if !ui.msg.is_empty() {
                     ui.msg.clone()
@@ -292,7 +302,10 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
 /// Ask for a package. The dialog runs modally, so not from inside the window's frame: macOS
 /// sends the window events while it is open (a mouse leaving it), and the window's code is still
 /// in the frame then (in GarageBand's AU host that aborts). On macOS it opens from the main queue
-/// once the frame is done; the answer lands in the returned slot (a path, or None if cancelled).
+/// once the frame is done; elsewhere on a thread of its own. On Windows it gets the window the
+/// click came from (the host's window around the plugin) as its owner, so it opens on top of it
+/// and that window takes no clicks until it closes; without one it opened behind the host. The
+/// answer lands in the returned slot (a path, or None if cancelled).
 type Answer = Arc<std::sync::Mutex<Option<Option<std::path::PathBuf>>>>;
 type Job = Arc<std::sync::Mutex<Option<Result<String, String>>>>;
 #[derive(Clone, Copy)]
@@ -303,11 +316,16 @@ fn pick(action: FileAction, name: &str) -> Answer {
     let slot = answer.clone();
     let name: String = name.chars().take(100).map(|c|
         if c.is_alphanumeric() || " _-".contains(c) { c } else { '_' }).collect();
+    #[cfg(target_os = "windows")]
+    let owner = win_owner::foreground();
     let ask = move || {
+        let dialog = rfd::FileDialog::new();
+        #[cfg(target_os = "windows")]
+        let dialog = match &owner { Some(o) => dialog.set_parent(o), None => dialog };
         let path = match action {
-            FileAction::Load => rfd::FileDialog::new()
+            FileAction::Load => dialog
                 .add_filter("FM-1 firmware or shared save", &["fwsc", "fm1save", "json"]).pick_file(),
-            FileAction::Export => rfd::FileDialog::new().add_filter("FM-1 shared save", &["fm1save"])
+            FileAction::Export => dialog.add_filter("FM-1 shared save", &["fm1save"])
                 .set_file_name(format!("{}.fm1save", if name.is_empty() { "FM-1" } else { &name })).save_file(),
         };
         *slot.lock().unwrap() = Some(path);
@@ -317,6 +335,38 @@ fn pick(action: FileAction, name: &str) -> Answer {
     #[cfg(not(target_os = "macos"))]
     std::thread::spawn(ask);
     answer
+}
+
+/// The window a Windows file dialog belongs to: the foreground window when the button was
+/// clicked, as a raw-window-handle for rfd.
+#[cfg(target_os = "windows")]
+mod win_owner {
+    use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle,
+                            RawWindowHandle, Win32WindowHandle, WindowHandle};
+    use std::num::NonZeroIsize;
+
+    #[link(name = "user32")]
+    extern "system" { fn GetForegroundWindow() -> isize; }
+
+    pub struct Owner(NonZeroIsize);
+
+    pub fn foreground() -> Option<Owner> {
+        NonZeroIsize::new(unsafe { GetForegroundWindow() }).map(Owner)
+    }
+
+    impl HasWindowHandle for Owner {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            let raw = RawWindowHandle::Win32(Win32WindowHandle::new(self.0));
+            // the handle came from the OS and is only used while the dialog is up
+            Ok(unsafe { WindowHandle::borrow_raw(raw) })
+        }
+    }
+
+    impl HasDisplayHandle for Owner {
+        fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+            Ok(DisplayHandle::windows())
+        }
+    }
 }
 
 // File I/O, hashing and serialization never run in the audio callback or window frame.
@@ -351,7 +401,9 @@ fn file_job(action: FileAction, mut path: std::path::PathBuf, params: Arc<Fm1Par
                 }
             }
         };
-        *result.lock().unwrap() = Some(run());
+        // (the error says which of the two it was: a refused load once read "Save file: …", #56)
+        let what = match action { FileAction::Load => "Load", FileAction::Export => "Export" };
+        *result.lock().unwrap() = Some(run().map_err(|e| format!("{what}: {e}")));
     });
     job
 }
