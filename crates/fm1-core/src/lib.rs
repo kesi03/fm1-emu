@@ -85,6 +85,10 @@ pub trait Bus {
     fn hw_lock(&mut self, _core: u32, _set: bool) -> bool {
         true
     }
+    /// `testset` on `core` found the byte at `addr` taken and spins on it (the SDK's byte
+    /// locks: `testset b[r]; ifeq goto` back to it). A dual-core bus may hand the machine to
+    /// the other core, the one that holds it.
+    fn spin(&mut self, _core: u32, _addr: u32) {}
     /// Would the next tick be due?
     fn next_tick_due(&self) -> bool {
         true
@@ -267,6 +271,11 @@ pub struct Cpu {
     pub jit_entries: u64,
     pub jit_insns: u64,
     pub jit_helpers: std::collections::BTreeMap<String, u64>,
+    /// The wasm JIT's exits by reason (`jit_wasm::EXIT_NAMES`), the instructions the calls so
+    /// ended ran, and its loads and stores by path (RAM, XIP, bus; RAM store, code word, bus)
+    pub exit_hist: [u64; 10],
+    pub exit_insns: [u64; 10],
+    pub mem_hist: [u64; 6],
     /// Instruction-cache misses (decodes) since reset.
     pub decodes: u64,
     /// Canonical syntax of the instruction executing (from its cache line).
@@ -440,7 +449,19 @@ impl Cpu {
 
     pub fn jit_profile_json(&self) -> String {
         let helpers = self.jit_helpers.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
-        format!("{{\"entries\":{},\"instructions\":{},\"helpers\":{{{helpers}}}}}", self.jit_entries, self.jit_insns)
+        #[cfg(target_arch = "wasm32")]
+        let exits = {
+            let names = jit_wasm::EXIT_NAMES;
+            let (regions, drops, resets, blocks, compiled) = self.wjit.as_ref().map_or((0, 0, 0, 0, 0), |j| (j.regions, j.drops, j.resets, j.blocks, j.compiled_blocks()));
+            let (bytes, bytes_max) = self.wjit.as_ref().map_or((0, 0), |j| (j.bytes, j.bytes_max));
+            let e = names.iter().zip(self.exit_hist).filter(|(_, n)| *n > 0).map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
+            let i = names.iter().zip(self.exit_insns).filter(|(_, n)| *n > 0).map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
+            let m = ["ld_ram", "ld_xip", "ld_bus", "st_ram", "st_code", "st_bus"].iter().zip(self.mem_hist).map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
+            format!(",\"exits\":{{{e}}},\"exit_insns\":{{{i}}},\"mem\":{{{m}}},\"regions\":{regions},\"bytes\":{bytes},\"bytes_max\":{bytes_max},\"drops\":{drops},\"resets\":{resets},\"region_blocks\":{blocks},\"compiled_blocks\":{compiled}")
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let exits = String::new();
+        format!("{{\"entries\":{},\"instructions\":{},\"insns\":{},\"helpers\":{{{helpers}}}{exits}}}", self.jit_entries, self.jit_insns, self.insn_count)
     }
 
     /// Count a JIT helper call when profiling. Called for every helper op, so the check is
@@ -594,7 +615,10 @@ impl Cpu {
         if self.stop_pc != 0 {
             return self.run_stretch(bus, budget);
         }
-        self.run_fast_in::<B, false>(bus, budget)
+        if self.cost_model {
+            return self.run_fast_in::<B, false, true>(bus, budget);
+        }
+        self.run_fast_in::<B, false, false>(bus, budget)
     }
 
     /// `run_fast` as a runner's stretch (`stop_pc`): the same loop with the stretch's per-block
@@ -602,12 +626,17 @@ impl Cpu {
     /// there, interpreted Melodee ran 15% slower).
     #[inline(never)]
     fn run_stretch<B: Bus>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
-        self.run_fast_in::<B, true>(bus, budget)
+        if self.cost_model {
+            return self.run_fast_in::<B, true, true>(bus, budget);
+        }
+        self.run_fast_in::<B, true, false>(bus, budget)
     }
 
-    /// `run_fast`'s loop; `STRETCH`: `stop_pc` is set (`run_stretch`).
+    /// `run_fast`'s loop; `STRETCH`: `stop_pc` is set (`run_stretch`); `COST`: `cost_model` is
+    /// (FM1_STRICT's measured costs: a copy of the loop with them, so the default one has none of
+    /// their tests per instruction, which cost it 30%).
     #[inline(always)]
-    fn run_fast_in<B: Bus, const STRETCH: bool>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
+    fn run_fast_in<B: Bus, const STRETCH: bool, const COST: bool>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
         if trace_on() {
             return Ok((0, false));
         }
@@ -812,7 +841,9 @@ impl Cpu {
                             // hot: compile its region (it runs from the next visit on)
                             let region = self.wasm_region(bus, id);
                             let ver = bus.code_writes().unwrap_or(u64::MAX);
-                            let ok = !region.is_empty() && self.wjit.as_mut().is_some_and(|j| j.install::<B>(&region, &mem, ver));
+                            // (profiling as the core is now: core 1 gets the flag after its release)
+                            let profile = self.profile;
+                            let ok = !region.is_empty() && self.wjit.as_mut().is_some_and(|j| j.install::<B>(&region, &mem, ver, profile));
                             if !ok {
                                 if let Some(j) = self.wjit.as_mut() {
                                     j.refuse(id);
@@ -911,18 +942,18 @@ impl Cpu {
                 let next_pc = pc + op.len as u32;
                 if !(careful || op.careful) {
                     // plain micro-op: cannot start or end a pair, block or loop
-                    if self.cost_model {
+                    if COST {
                         bus.fetch_cost(pc);
                     }
                     pc = self.exec_fast(bus, op.fast, next_pc).unwrap_or(next_pc);
                     n += 1;
-                    if self.cost_model {
+                    if COST {
                         let at = next_pc - op.len as u32;
                         bus.add_ticks((op_cost8(&op.fast, op.len, pc != next_pc, pc < at) - 1) as u64);
                     }
                 } else {
                     sync!();
-                    if self.cost_model {
+                    if COST {
                         bus.fetch_cost(pc);
                     }
                     // (it counts what it runs in insn_count itself; a swapped pair is two)
@@ -930,7 +961,7 @@ impl Cpu {
                     n += r & 3;
                     synced = n;
                     pc = self.pc;
-                    if self.cost_model {
+                    if COST {
                         // (an op the plain path cannot run: each instruction it ran by its class,
                         // as `step` charges them; each has had its one tick)
                         let at = next_pc - op.len as u32;
@@ -1152,6 +1183,11 @@ impl Cpu {
                 continue;
             }
             let Ok(Some((bid, start, len))) = self.block_at(bus, pc) else { continue };
+            // (a block the loop never ran: likely cold, left out; one compiled already: the
+            // region's exit chains into its region. Either gets a region of its own if it turns hot)
+            if !out.is_empty() && self.wjit.as_ref().is_some_and(|j| j.never_ran(bid) || j.compiled(bid)) {
+                continue;
+            }
             let all = &self.bops[start as usize..(start + len) as usize];
             let mut ops: Vec<BOp> = all.iter().take_while(|o| !o.careful).copied().collect();
             let (all_len, tail) = (all.len(), all.get(ops.len()).copied());
@@ -3126,6 +3162,12 @@ impl Cpu {
                 let old = bus.read8(addr);
                 self.cc = old != 0;
                 bus.write8(addr, old | 0x80);
+                // taken, with `ifeq goto` back to it next (`40 e8 fd ff`: the SDK's byte
+                // spinlock): the core spins on this byte. A try-lock, or a claim-a-job byte
+                // that is often set, takes no such loop and records no wait.
+                if old != 0 && bus.fetch32(next_pc) == 0xfffd_e840 {
+                    bus.spin(self.core_id, addr);
+                }
             }
             24 => {
                 // `ifeq/ifne goto #off` (40/41 e8): off = 2*sext16(bits(16,31))
@@ -3674,8 +3716,8 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
             raw(if win & 0xffff == 0xf53f { &FPU_MAC_PAIR_CRAW } else { &FPU_MAC_CRAW })
         }
         // 4-byte ALU forms decode_alu4 knows the layout of (`6c e8` `[R+#i] <<= #n`, `64 e8`
-        // `[R+#i] &= R`, ...): the table's classes fit only the offsets the corpora used
-        // (m6502's `[r0+24] <<= 1`, `[r1+-4] &= r0`)
+        // `[R+#i] &= R`, `6e e8` `[R+#i] >>= R`, ...): the table's classes fit only the offsets
+        // the corpora used (m6502's `[r0+24] <<= 1`, `[r1+-4] &= r0`), and had no `6e e8` at all
         Err(_) if decode_alu4(win & 0xffff_ffff).is_some() => raw(&ALU4_CRAW),
         // `d0..d7 ec`: word loads / stores at an offset or pre-incremented (route 18)
         Err(_) if matches!(win & 0xff, 0xd0..=0xd7) && (win >> 8) & 0xff == 0xec => raw(&WORD_MEM_CRAW),
@@ -4336,13 +4378,20 @@ fn decode_alu4(raw: u64) -> Option<Alu4> {
                 rhs: Rhs::Bit(((raw >> 24) & 0xf) as usize),
             })
         }
-        0xe8 if matches!(b0, 0x64 | 0x68) => {
+        // `6e e8`: `[R+#i] <<= R` / `>>= R` / `>>>= R`, the register twin of `6c e8` (op bits
+        // 16-17 as there: 0 <<, 2 >>, 3 >>>; 1 is the vendor's saturating `<<<=`, not taken).
+        // No corpus had one; BB1 2.1.1's `6e e8 0a 01` [r0+8] >>= r1 halted the emulator. The
+        // layout checked on 64 encodings against the vendor objdump (`6f e8` is unknown to it).
+        0xe8 if matches!(b0, 0x64 | 0x68 | 0x6e) => {
             let op = match (b0, (raw >> 16) & 3) {
                 (0x64, 0) => Op::Or,
                 (0x64, 1) => Op::Xor,
                 (0x64, 2) => Op::And,
                 (0x68, 0) => Op::Add,
                 (0x68, 2) => Op::Sub,
+                (0x6e, 0) => Op::Shl,
+                (0x6e, 2) => Op::Shr,
+                (0x6e, 3) => Op::Sar,
                 _ => return None,
             };
             Some(Alu4 {
@@ -4837,6 +4886,31 @@ mod tests {
         cpu.step(&mut ram).unwrap();
         assert_eq!(ram.read32(0x48), 0x0000_f0f0 & 0x0f);
         assert_eq!(cpu.pc, 16);
+    }
+
+    #[test]
+    fn mem_shift_by_register() {
+        // `6e e8 0a 01` [r0+8] >>= r1 (BB1 2.1.1's, the first seen) ; `6e e8 00 05` [r0+0] <<= r5 ;
+        // `6e e8 0f 71` [r7+12] >>>= r1 ; `6e e8 01 01` [r0+0] <<<= r1 is not decoded
+        let mut mem = vec![0u8; 0x100];
+        mem[..12].copy_from_slice(&[0x6e, 0xe8, 0x0a, 0x01, 0x6e, 0xe8, 0x00, 0x05, 0x6e, 0xe8, 0x0f, 0x71]);
+        mem[0x40..0x44].copy_from_slice(&0x0000_0081u32.to_le_bytes());
+        mem[0x48..0x4c].copy_from_slice(&0x8000_0f00u32.to_le_bytes());
+        mem[0x5c..0x60].copy_from_slice(&0xffff_ff00u32.to_le_bytes());
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.regs[0] = 0x40;
+        cpu.regs[7] = 0x50;
+        cpu.regs[1] = 4;
+        cpu.regs[5] = 33; // (a shift by a register counts modulo 32)
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(ram.read32(0x48), 0x0800_00f0, "[r0+8] >>= r1: logical");
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(ram.read32(0x40), 0x0000_0102, "[r0+0] <<= r5");
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(ram.read32(0x5c), 0xffff_fff0, "[r7+12] >>>= r1: arithmetic");
+        assert_eq!(cpu.pc, 12);
+        assert!(decode_alu4(0x0101_e86e).is_none(), "the saturating <<<= is not taken");
     }
 
     #[test]

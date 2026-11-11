@@ -3,7 +3,7 @@
 // that runs the emulator. Every firmware boots from its whole update package (.fwsc), unpacked
 // in the wasm: a catalog entry's fetched from its author's site, or one opened from this
 // computer (M-VAVE's own: their server does not let other pages fetch it).
-import { fetchPackage } from "./fwsc.js";
+import { fetchPackage, hubNewcomers, hubCardUrl } from "./fwsc.js";
 import { SaveStore, packageHash, changedSectors, packSectors, exportSave, importSave } from "./persistence.js";
 import { tryOutOf, loadTryOut } from "./tryout.js";
 
@@ -22,6 +22,13 @@ const stored = (k) => { try { return localStorage.getItem(k); } catch { return n
 const store = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } };
 
 const catalog = await (await fetch("firmwares.json")).json();
+// The Hub's firmwares not in the file yet, listed last as not yet run here (none when the Hub
+// does not answer in time; the read goes on for the package fallback). The SMK-37's list is its own.
+let hubWait;
+const newcomers = DEVICE === "fm1"
+  ? await Promise.race([hubNewcomers(catalog), new Promise((ok) => { hubWait = setTimeout(() => ok([]), 3000); })]).finally(() => clearTimeout(hubWait))
+  : [];
+catalog.firmwares.push(...newcomers);
 const byId = new Map(catalog.firmwares.map((f) => [f.id, f]));
 // the FM-1 Firmware Hub's ids too, where they differ (its cards link here with ?fw=<its id>)
 for (const f of catalog.firmwares) if (f.hub && !byId.has(f.hub)) byId.set(f.hub, f);
@@ -29,7 +36,12 @@ for (const f of catalog.firmwares) if (f.hub && !byId.has(f.hub)) byId.set(f.hub
 // <head> set data-embed before the first paint; style.css hides the rest). It does not change the
 // firmware this browser starts with on the full page.
 const EMBED = document.documentElement.hasAttribute("data-embed");
-let fw = byId.get(params.get("fw")) || byId.get(stored(DEV.key + "fw")) || byId.get(catalog.default) || catalog.firmwares[0];
+// ?package=URL: a package on another site (https), for a page that lists firmware this one does not
+// (mutant.cloud's "Try", other hubs, older versions); &name= names it. It plays like a catalog entry,
+// its saved flash kept by its package as every firmware's is, and is not added to the list for later.
+const linked = linkedFirmware(params);
+if (linked) byId.set(linked.id, linked);
+let fw = linked || byId.get(params.get("fw")) || byId.get(stored(DEV.key + "fw")) || byId.get(catalog.default) || catalog.firmwares[0];
 // ?flash= / ?script=: a try-out of that firmware (web/tryout.js), from this site's own files: a session of its
 // own (this browser's saved flash neither loaded nor saved), started at once where the browser lets it play
 let tryOut = null, tryOutError = null;
@@ -41,6 +53,17 @@ try {
 function tell(state, text = "") {
   if (typeof window === "undefined" || window.parent === window) return;
   try { window.parent.postMessage({ source: "fm1-emu", type: "tryout", state, text }, location.origin); } catch { /* not ours */ }
+}
+function linkedFirmware(q) {
+  let url;
+  try { url = new URL(q.get("package")); } catch { return null; }
+  if (url.protocol !== "https:") return null;
+  const raw = url.pathname.split("/").pop() || url.host;
+  let file = raw;
+  try { file = decodeURIComponent(raw); } catch { /* a malformed escape: the name as written */ }
+  file = file.replace(/\.fwsc$/i, "");
+  return { id: "link", name: q.get("name") || file, version: "", author: "", license: "", about: "",
+    repo: url.href, package: url.href, link: true };
 }
 function endTryOut() {
   if (!tryOut) return;
@@ -114,7 +137,14 @@ function setBoard(b) {
 setBoard(DEV.board);
 
 // ---------------------------------------------------------------- firmware and clock
-for (const f of catalog.firmwares) fwSel.add(new Option(`${f.name} ${f.version}`, f.id));
+for (const f of catalog.firmwares) if (!f.untested) fwSel.add(new Option(`${f.name} ${f.version}`, f.id));
+if (newcomers.length) {
+  const group = document.createElement("optgroup");
+  group.label = "New on the Hub, not yet run here";
+  for (const f of newcomers) group.append(new Option(`${f.name} ${f.version}`, f.id));
+  fwSel.append(group);
+}
+if (linked) fwSel.add(new Option(`${linked.name} (from a link)`, linked.id), 0);
 for (const c of new Set([...CLOCKS, mhz].sort((a, b) => a - b))) mhzSel.add(new Option(`${c} MHz`, c));
 fwSel.value = fw.id;
 mhzSel.value = mhz;
@@ -127,7 +157,8 @@ const MIDI_NOTES = {
   choralroot: NO_NOTE, hortator: NO_NOTE, "sloop-alg": NO_NOTE, x0x: NO_NOTE,
 };
 const cards = new Map();
-const hubCard = (f) => `https://thefirmwarehub.com/#fw-${f.hub}`;
+const hubCard = (f) => hubCardUrl(f.hub);
+const UNTESTED = "New on the Hub: not yet run in the emulator, so it may not work here";
 // the FM-1 page: which entries have an SMK-37 build (that catalog names them)
 const twins = new Map();
 if (DEVICE === "fm1") {
@@ -173,6 +204,7 @@ if (DEVICE === "fm1") {
       el("p", "what", f.byo && DEVICE === "fm1" ? "The firmware the FM-1 ships with: a DX7-style FM synth, both cores running. " +
         "Bring your own copy (see below)." : f.about));
     if (DEVICE === "fm1" && MIDI_NOTES[f.id]) card.append(el("div", "midi", MIDI_NOTES[f.id]));
+    if (f.untested) card.append(el("div", "untested", UNTESTED));
     card.append(links);
     list.append(card);
     cards.set(f.id, card);
@@ -190,7 +222,7 @@ async function keptEntry(id) {
 async function packageOf(f) {
   if (f.id === "local") return { bytes: f.bytes, url: null };
   if (packages.has(f.id)) return packages.get(f.id);
-  const kept = await keptEntry(f.id);
+  const kept = !f.link && await keptEntry(f.id);   // (a link's entry is whichever link ran last)
   if (kept) {
     const got = { bytes: kept.package, url: kept.url };
     packages.set(f.id, got);
@@ -243,6 +275,8 @@ function showFirmware() {
   let parts;
   if (fw.id === "local") {
     parts = [b, "Opened from this computer; kept with its saved flash after Start."];
+  } else if (fw.link) {
+    parts = [b, "From a link: not in this page's list, so it may not run here."];
   } else if (fw.byo) {
     const dl = document.createElement("a");
     dl.href = fw.download;
@@ -272,6 +306,12 @@ function showFirmware() {
     what.className = "what";
     what.textContent = fw.about;
     parts = [b, `by ${fw.author}`, links, what];
+    if (fw.untested) {
+      const note = document.createElement("span");
+      note.className = "untested";
+      note.textContent = UNTESTED + ".";
+      parts.push(" ", note);
+    }
   }
   if (loadedUrl) {
     const p = document.createElement("a");
@@ -283,8 +323,10 @@ function showFirmware() {
   const q = new URLSearchParams(location.search);
   q.set("fw", fw.id);
   q.set("mhz", mhz);
+  if (!fw.link) { q.delete("package"); q.delete("name"); }
   history.replaceState(null, "", `?${q}`);
   const full = new URLSearchParams(fw.id === "local" ? "" : { fw: fw.id });
+  if (fw.link) for (const k of ["package", "name"]) if (q.has(k)) full.set(k, q.get(k));
   if (tryOut) for (const k of ["flash", "script"]) if (q.has(k)) full.set(k, q.get(k));
   document.getElementById("fullpage").href = `./${String(full) ? `?${full}` : ""}`;
 }
@@ -294,7 +336,7 @@ fwSel.addEventListener("change", () => {
   fw = byId.get(fwSel.value) || localFw;
   endTryOut();
   loadedUrl = null;
-  if (!EMBED) store(DEV.key + "fw", fw.id);
+  if (!EMBED && !fw.link) store(DEV.key + "fw", fw.id);   // a link is not kept: the next visit has the last pick
   showFirmware();
   fwSel.blur();                 // back to playing from the keyboard
   if (node) boot();

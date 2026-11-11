@@ -113,7 +113,8 @@
       more from <a href="https://fm1-editor.com/firmware/">fm1-editor.com/firmware ↗</a>, this repository's
       <a href="fm1-sid/">FM-1 SID</a> and M-VAVE's own. Each is its author's build, unchanged, downloaded when you
       start it. Each card links its source; the Hub has the full story of each firmware and installs it on your
-      own FM-1.</p>
+      own FM-1. Firmwares the Hub has that nobody has run here yet come last, marked so: they may not work
+      yet, and the next refresh of the list moves them up or says why not.</p>
     <ul class="cards" id="fwlist"></ul>
   </section>
 
@@ -290,6 +291,7 @@
             <li>The front panel is drawn by the same Rust code as the native version, <code>fm1-live</code>, which
               plays the firmwares in a window with audio and MIDI in.</li>
             <li>Links keep a setup: <code>?fw=x0x&amp;mhz=120</code> picks the firmware and the clock;
+              <code>?package=URL&amp;name=Name</code> plays a package from another site (https, with CORS on);
               <code>?jit=0</code> turns the JIT off; <code>?ahead=0</code> stops the emulator running ahead of the
               audio (by up to one of the firmware's audio buffers, for an even load). The page also remembers your last
               choices.</li>

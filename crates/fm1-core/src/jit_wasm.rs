@@ -42,8 +42,8 @@ pub static COMPILE_BUDGET: AtomicU32 = AtomicU32::new(u32::MAX);
 const HOT: u32 = 32;
 
 /// Most blocks / instructions in one region (Safari's top tier skips very large functions).
-pub(crate) const REGION_BLOCKS: usize = 32;
-pub(crate) const REGION_OPS: usize = 384;
+pub(crate) const REGION_BLOCKS: usize = 96;
+pub(crate) const REGION_OPS: usize = 1152;
 
 #[derive(Clone, Copy)]
 enum Entry {
@@ -61,8 +61,16 @@ pub struct Jit {
     pub(crate) rinfo: Vec<(Box<[usize]>, u64)>,
     pub regions: u32,
     pub bytes: usize,
+    /// the largest region module
+    pub bytes_max: usize,
+    /// regions dropped for RAM code that changed, and resets (the block table rebuilt)
+    pub drops: u32,
+    pub resets: u32,
+    /// blocks compiled into regions, all told (with the copies: a block reachable from several
+    /// hot blocks is in each one's region)
+    pub blocks: u32,
     /// compile helper calls that count themselves (`Cpu::profile` when the JIT was made)
-    profile: bool,
+    pub profile: bool,
     /// compile the checks of a runner's stretch at each block's entry (`Cpu::stop_checks`:
     /// core 1, whose runner probes for polling loops)
     pub(crate) stops: bool,
@@ -83,7 +91,7 @@ impl std::fmt::Debug for Jit {
 
 impl Jit {
     pub fn new(profile: bool) -> Option<Jit> {
-        Some(Jit { state: Vec::new(), rinfo: Vec::new(), regions: 0, bytes: 0, profile, stops: false, cache: vec![(0, 0, 0, 0); CACHE].into_boxed_slice() })
+        Some(Jit { state: Vec::new(), rinfo: Vec::new(), regions: 0, bytes: 0, bytes_max: 0, drops: 0, resets: 0, blocks: 0, profile, stops: false, cache: vec![(0, 0, 0, 0); CACHE].into_boxed_slice() })
     }
 
     fn at(&mut self, id: usize) -> &mut Entry {
@@ -118,13 +126,24 @@ impl Jit {
         }
     }
 
+    /// Did block `id` never run through the loop (no visit counted)? Reachable from a hot block,
+    /// such a block is left out of its region (`Cpu::wasm_region`): it is likely cold.
+    pub(crate) fn never_ran(&self, id: usize) -> bool {
+        matches!(self.state.get(id), None | Some(Entry::Cold(0)))
+    }
+
+    /// Is block `id` compiled already (in some region)?
+    pub(crate) fn compiled(&self, id: usize) -> bool {
+        matches!(self.state.get(id), Some(Entry::In(..)))
+    }
+
     /// Compile a region (blocks with their ids; the first is the hot one) and install it: every
     /// block not yet in a region gets this one. `ver`: the bus's count of code-word writes, its
     /// RAM blocks having just been found current. False: it could not be compiled.
-    pub(crate) fn install<B: Bus>(&mut self, blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, ver: u64) -> bool {
+    pub(crate) fn install<B: Bus>(&mut self, blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, ver: u64, profile: bool) -> bool {
         COMPILE_BUDGET.fetch_sub(1, Ordering::Relaxed);
-        let m = compile::<B>(blocks, mem, self.stops);
-        let [r, w, o] = helpers::<B>(self.profile);
+        let m = compile::<B>(blocks, mem, self.stops, profile);
+        let [r, w, o] = helpers::<B>(profile);
         // SAFETY: a plain byte slice; the host copies it before returning
         let f = unsafe { fm1_jit_compile(m.as_ptr(), m.len(), r, w, o) };
         if f == 0 {
@@ -132,6 +151,8 @@ impl Jit {
         }
         self.regions += 1;
         self.bytes += m.len();
+        self.bytes_max = self.bytes_max.max(m.len());
+        self.blocks += blocks.len() as u32;
         let r = self.rinfo.len() as u32;
         let ram = blocks.iter().filter(|b| !(0x0200_0000..0x0400_0000).contains(&b.1)).map(|b| b.0).collect();
         self.rinfo.push((ram, ver));
@@ -145,6 +166,7 @@ impl Jit {
 
     /// Region `r` ran from RAM that has changed: its blocks are hot again, to be compiled anew.
     pub(crate) fn drop_region(&mut self, r: u32) {
+        self.drops += 1;
         for e in self.state.iter_mut() {
             if matches!(*e, Entry::In(_, _, q) if q == r) {
                 *e = Entry::Cold(0);
@@ -156,6 +178,11 @@ impl Jit {
         }
     }
 
+    /// Blocks compiled now (each counted once, whatever regions hold a copy).
+    pub fn compiled_blocks(&self) -> u32 {
+        self.state.iter().filter(|e| matches!(e, Entry::In(..))).count() as u32
+    }
+
     /// Block `id` stays interpreted.
     pub(crate) fn refuse(&mut self, id: usize) {
         *self.at(id) = Entry::No;
@@ -163,6 +190,7 @@ impl Jit {
 
     /// Forget every compiled block (the block table was rebuilt; the table slots stay in use).
     pub fn reset(&mut self) {
+        self.resets += 1;
         self.state.clear();
         self.rinfo.clear();
         self.cache.fill((0, 0, 0, 0));
@@ -183,6 +211,10 @@ pub struct Ctx {
     /// left inside an if-else block's then-part: its skip (then end, else end, then start), for
     /// `run` to put in `Cpu::pred_skips` as the interpreter has it there (0: none)
     pred: [u32; 3],
+    /// profiling (`Jit::profile`): why the code left (`Gen::reason`), and its loads and stores
+    /// by path (RAM, XIP, bus; RAM store, code-word store, bus store)
+    reason: u32,
+    hist: [u32; 6],
 }
 
 /// Run compiled code: returns the instructions executed; cpu.pc is set. At most `cap`
@@ -193,11 +225,18 @@ pub struct Ctx {
 pub(crate) unsafe fn run<B: Bus>(f: u32, start: u32, cpu: &mut Cpu, bus: &mut B, extra: u32, cap: u32) -> u32 {
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
     let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
-    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, pred: [0; 3] };
+    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, pred: [0; 3], reason: 0, hist: [0; 6] };
     // SAFETY: on wasm32 a function pointer is its index in the function table, where the host
     // installed this block's `run` with exactly this signature
     let code: extern "C" fn(*mut Cpu, *mut Ctx, u32, u32) -> u32 = unsafe { std::mem::transmute(f as usize) };
     let k = code(cpu as *mut Cpu, &mut ctx, limit, start);
+    if cpu.profile {
+        cpu.exit_hist[(ctx.reason as usize).min(cpu.exit_hist.len() - 1)] += 1;
+        cpu.exit_insns[(ctx.reason as usize).min(cpu.exit_insns.len() - 1)] += k as u64;
+        for (h, c) in cpu.mem_hist.iter_mut().zip(ctx.hist) {
+            *h += c as u64;
+        }
+    }
     if ctx.pred[0] != 0 {
         let (te, ee, ts) = (ctx.pred[0], ctx.pred[1], ctx.pred[2]);
         cpu.pred_skips.retain(|&(t, _, _)| t != te);
@@ -324,6 +363,7 @@ const IF: u8 = 0x04;
 const ELSE: u8 = 0x05;
 const END: u8 = 0x0b;
 const BR: u8 = 0x0c;
+const BR_IF: u8 = 0x0d;
 const BR_TABLE: u8 = 0x0e;
 const RETURN: u8 = 0x0f;
 const CALL: u8 = 0x10;
@@ -423,6 +463,8 @@ const L_CUR: u32 = 10;
 const L_OPRES: u32 = 11;
 const L_FA: u32 = 12;
 const L_FB: u32 = 13;
+/// a block's probe points: the stop pc when it lies inside the block (`block`), else 0
+const L_STOPI: u32 = 14;
 
 fn off_reg(r: u8) -> u32 {
     (offset_of!(Cpu, regs) + 4 * (r & 15) as usize) as u32
@@ -450,6 +492,14 @@ fn off_hold() -> u32 {
 }
 const OFF_BRK: u32 = offset_of!(Ctx, brk) as u32;
 const OFF_PRED: u32 = offset_of!(Ctx, pred) as u32;
+const OFF_REASON: u32 = offset_of!(Ctx, reason) as u32;
+const OFF_HIST: u32 = offset_of!(Ctx, hist) as u32;
+
+/// Exit reasons the code records when profiling (`Cpu::exit_hist`): the block does not fit the
+/// limit; a stretch's stop pc; its `stop_io` or room; a goto out of the region; a return, a
+/// table branch, a helper's jump to a block outside it; the next tick due after a bus op, and
+/// the same inside a then-part.
+pub const EXIT_NAMES: [&str; 10] = ["none", "limit", "stop", "stop_io", "goto_out", "rts_out", "tb_out", "op_out", "brk", "brk_pred"];
 
 struct Gen<'a> {
     c: Vec<u8>,
@@ -467,6 +517,8 @@ struct Gen<'a> {
     nest: u32,
     /// the stretch's stop checks at each block's entry (`Jit::stops`)
     stops: bool,
+    /// record the exit reason and the memory paths (`Jit::profile`)
+    prof: bool,
 }
 
 impl Gen<'_> {
@@ -539,7 +591,7 @@ impl Gen<'_> {
     /// continue at the pc in local l (a return, a pc popped, a table branch, a helper's jump):
     /// the region's block there, found in its table, else back to Rust. (Every such jump used
     /// to leave: X0X went back to the dispatcher every 15 instructions.)
-    fn jump_local(&mut self, l: u32, count: u32) {
+    fn jump_local(&mut self, l: u32, count: u32, reason: u32) {
         if let Some((table, mask)) = self.table {
             // L_OFF = the entry's offset; its pc there: continue at its block
             self.get(l);
@@ -565,6 +617,7 @@ impl Gen<'_> {
             uleb(&mut self.c, (self.n - 1 - self.cur + self.nest) as u64);
             self.end();
         }
+        self.reason(reason);
         self.exit_local(l, count);
     }
     /// continue at a fixed pc, `count` instructions of this block done: the region's block there,
@@ -572,6 +625,7 @@ impl Gen<'_> {
     /// follows, so going there is falling through)
     fn goto(&mut self, pc: u32, count: u32, last: bool) {
         let Some(&k) = self.index.get(&pc) else {
+            self.reason(4);
             self.exit_imm(pc, count);
             return;
         };
@@ -625,6 +679,25 @@ impl Gen<'_> {
         self.op(END);
         self.nest -= 1;
     }
+    /// profiling: ctx.reason = r (before an exit)
+    fn reason(&mut self, r: u32) {
+        if self.prof {
+            self.get(L_CTX);
+            self.i32c(r);
+            self.mem_op(I32_STORE, 2, OFF_REASON);
+        }
+    }
+    /// profiling: ctx.hist[i] += 1
+    fn count(&mut self, i: u32) {
+        if self.prof {
+            self.get(L_CTX);
+            self.get(L_CTX);
+            self.mem_op(I32_LOAD, 2, OFF_HIST + 4 * i);
+            self.i32c(1);
+            self.op(I32_ADD);
+            self.mem_op(I32_STORE, 2, OFF_HIST + 4 * i);
+        }
+    }
     /// push the helpers' instruction index of op i of this block
     fn idx(&mut self, i: u32) {
         self.done_plus(i);
@@ -633,6 +706,62 @@ impl Gen<'_> {
     fn call(&mut self, f: u32) {
         self.op(CALL);
         uleb(&mut self.c, f as u64);
+    }
+    /// Before instruction `ins` of a block with probe points, at pc: if that is the stop (`L_STOPI`),
+    /// the runner's checks between its calls, as at a block's entry: the registers and sp as when
+    /// its probe began leave (polling with nothing to do); a helper that reached the bus
+    /// (`stop_io`) or less than `STRETCH_ROOM` of the limit left leaves too; else on. (A stop
+    /// inside a block left before it, and the lap went on from a block of its own: DUELL's core
+    /// 1, two-instruction blocks, came back to Rust 4 times a lap.)
+    fn probe_point(&mut self, pc: u32, ins: u32) {
+        self.get(L_STOPI);
+        self.i32c(pc);
+        self.op(I32_EQ);
+        self.if_();
+        // the registers against the probe's, a word at a time (a loop: unrolled, 17 tests at
+        // each point made Bubba Machine's regions a third bigger), then sp; all equal: leave
+        self.op(BLOCK);
+        self.op(VOID);
+        self.i32c(0);
+        self.set(L_A);
+        self.op(LOOP);
+        self.op(VOID);
+        for off in [off_reg(0), off_probe(0)] {
+            self.get(L_CPU);
+            self.get(L_A);
+            self.op(I32_ADD);
+            self.mem_op(I32_LOAD, 2, off);
+        }
+        self.op(I32_NE);
+        self.op(BR_IF);
+        uleb(&mut self.c, 1); // (out of the block: they differ)
+        self.get(L_A);
+        self.i32c(4);
+        self.op(I32_ADD);
+        self.tee(L_A);
+        self.i32c(64);
+        self.op(I32_LT_U);
+        self.op(BR_IF);
+        uleb(&mut self.c, 0); // (round the loop)
+        self.op(END);
+        self.ld_field(off_sp());
+        self.ld_field(off_probe(16));
+        self.op(I32_NE);
+        self.op(BR_IF);
+        uleb(&mut self.c, 0);
+        self.reason(2);
+        self.exit_imm(pc, ins);
+        self.op(END);
+        self.ld_field(off_stop_io());
+        self.done_plus(ins + crate::STRETCH_ROOM);
+        self.get(L_LIMIT);
+        self.op(I32_GE_U);
+        self.op(I32_OR);
+        self.if_();
+        self.reason(3);
+        self.exit_imm(pc, ins);
+        self.end();
+        self.end();
     }
     /// After an op that may have called the bus: leave if the next tick is due (and, between a
     /// glued pair's two instructions, keep interrupts back until the second has run).
@@ -645,6 +774,7 @@ impl Gen<'_> {
             self.i32c(1);
             self.mem_op(I32_STORE, 2, off_hold());
         }
+        self.reason(if self.pred.is_some() { 9 } else { 8 });
         match self.pred {
             // inside an if-else block's then-part: at its end the skip is taken (as `finish`),
             // before it the skip goes with the exit (`run` puts it in pred_skips)
@@ -777,11 +907,13 @@ impl Gen<'_> {
             self.i32c(len.saturating_sub(w as u32));
             self.op(I32_LE_U);
             self.if_();
+            self.count(if gbase == mem.ram_base { 0 } else { 1 });
             self.get(L_OFF);
             self.mem_op(ld, align, host);
             self.set(L_VAL);
             self.op(ELSE);
         }
+        self.count(2);
         self.get(L_CTX);
         self.get(L_ADDR);
         self.idx(idx);
@@ -822,6 +954,7 @@ impl Gen<'_> {
         self.mem_op(I32_LOAD8_U, 0, mem.ram_code as u32);
         self.op(I32_EQZ);
         self.if_();
+        self.count(3);
         self.get(L_OFF);
         self.get(L_VAL);
         match w {
@@ -830,9 +963,11 @@ impl Gen<'_> {
             _ => self.mem_op(I32_STORE8, 0, mem.ram as u32),
         }
         self.op(ELSE);
+        self.count(4);
         self.store_bus(w, idx);
         self.end();
         self.op(ELSE);
+        self.count(5);
         self.store_bus(w, idx);
         self.end();
     }
@@ -873,7 +1008,7 @@ fn helpers<B: Bus>(profile: bool) -> [u32; 3] {
     ]
 }
 
-fn compile<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, stops: bool) -> Vec<u8> {
+fn compile<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, stops: bool, prof: bool) -> Vec<u8> {
     let n = blocks.len() as u32;
     let mut g = Gen {
         c: Vec::with_capacity(64 * blocks.iter().map(|b| b.2.len()).sum::<usize>()),
@@ -885,6 +1020,7 @@ fn compile<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, stops
         n,
         nest: 0,
         stops,
+        prof,
     };
     // loop { block_{n-1} { .. block_0 { br_table cur } code_0 } code_1 .. } code_{n-1} }: a br
     // to depth k from the innermost block lands on code_k; code_k reaches the loop through the
@@ -923,8 +1059,17 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
     g.get(L_LIMIT);
     g.op(I32_GT_U);
     g.if_();
+    g.reason(1);
     g.exit_imm(pc0, 0);
     g.end();
+    // a block whose instructions after the first can each be where a runner's call ends: plain
+    // ops (no glued pair, pair head or if-else block), outside a then-part
+    let probe_ok = g.stops && (2..=PROBE_OPS).contains(&ops.len()) && g.pred.is_none()
+        && ops.iter().all(|o| !o.glue && !o.pair_head && !matches!(o.fast, Fast::IfBlk { has_else: true, .. }));
+    if probe_ok {
+        g.i32c(0);
+        g.set(L_STOPI);
+    }
     // a runner's stretch (`Cpu::stop_pc`), as jit.rs compiles it: past the call's first block,
     // leave before a block that holds the stop pc, once a helper reached the bus (`stop_io`),
     // or with less than `STRETCH_ROOM` of the limit left (the runner's checks come at the
@@ -957,17 +1102,25 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
         g.op(I32_EQ);
         g.op(I32_AND);
         g.if_();
+        g.reason(2);
         g.exit_imm(pc0, 0);
         g.end();
         g.op(ELSE);
-        // the stop pc inside the block, past its start: leave before it
+        // the stop pc inside the block, past its start: leave before it, or, where the block has
+        // probe points, run to it and make the runner's checks there (`probe_point`)
         g.get(L_VAL);
         g.i32c(pc0);
         g.op(I32_SUB);
         g.i32c(bytes);
         g.op(I32_LT_U);
         g.if_();
-        g.exit_imm(pc0, 0);
+        if probe_ok {
+            g.get(L_VAL);
+            g.set(L_STOPI);
+        } else {
+            g.reason(2);
+            g.exit_imm(pc0, 0);
+        }
         g.end();
         g.end();
         // a helper reached the bus, or less than `STRETCH_ROOM` of the limit left
@@ -979,16 +1132,40 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
         g.op(I32_GE_U);
         g.op(I32_OR);
         g.if_();
+        g.reason(3);
         g.exit_imm(pc0, 0);
         g.end();
         g.end();
         g.end();
     }
 
+    if probe_ok {
+        // the copy for a stop pc inside the block (`L_STOPI` set above): with the runner's
+        // checks before each instruction after the first; the block as ever otherwise
+        g.get(L_STOPI);
+        g.if_();
+        block_ops::<B>(g, pc0, ops, true);
+        g.end();
+    }
+    block_ops::<B>(g, pc0, ops, false);
+}
+
+/// The longest block with probe points (`block`): each point is a test of every register, and
+/// the copy doubles the block, which made Bubba Machine's regions 60-80% bigger, and slower in a
+/// wasm engine, with no copy for its longer blocks. Short blocks are where a stop inside one
+/// costs most: a lap of them is a few instructions (DUELL's core 1: two-instruction blocks).
+const PROBE_OPS: usize = 4;
+
+/// The ops of a block from pc0 and its way out; `probe`: with the runner's checks at the stop
+/// pc (`Gen::probe_point`) before each instruction after the first.
+fn block_ops<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp], probe: bool) {
     let mut pc = pc0;
     let mut ended = false;
     for (i, op) in ops.iter().enumerate() {
         let idx = i as u32;
+        if probe && idx > 0 {
+            g.probe_point(pc, idx);
+        }
         let next_pc = pc + op.len as u32;
         let count = idx + 1;
         let mut bus_used = false;
@@ -1578,7 +1755,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.i32c(4);
                 g.op(I32_ADD);
                 g.mem_op(I32_STORE, 2, off_sp());
-                g.jump_local(L_VAL, count);
+                g.jump_local(L_VAL, count, 5);
                 ended = true;
             }
             Fast::PushRets { n } => {
@@ -1625,7 +1802,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.i32c(4);
                 g.op(I32_ADD);
                 g.mem_op(I32_STORE, 2, off_sp());
-                g.jump_local(L_VAL, count);
+                g.jump_local(L_VAL, count, 5);
                 ended = true;
             }
             Fast::BrI { a, v, cond, target } => {
@@ -1775,13 +1952,13 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.ld_reg(r); g.i32c(next_pc); g.op(I32_ADD); g.set(L_ADDR);
                 g.load(if half { 2 } else { 1 }, false, idx);
                 g.get(L_VAL); g.i32c(1); g.op(I32_SHL); g.i32c(next_pc); g.op(I32_ADD);
-                g.set(L_VAL); g.jump_local(L_VAL, count);
+                g.set(L_VAL); g.jump_local(L_VAL, count, 6);
                 ended = true;
             }
             Fast::Rts => {
                 g.ld_field(off_rets());
                 g.set(L_VAL);
-                g.jump_local(L_VAL, count);
+                g.jump_local(L_VAL, count, 5);
                 ended = true;
             }
             // ---- everything else: the interpreter's executor for this one op
@@ -1803,7 +1980,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.get(L_OPRES);
                 g.op(I32_WRAP_I64);
                 g.set(L_VAL);
-                g.jump_local(L_VAL, count);
+                g.jump_local(L_VAL, count, 7);
                 g.end();
                 bus_used = true;
             }
@@ -1893,7 +2070,7 @@ pub fn int_selftest() -> u32 {
     }
     for fast in ops {
         let bop = crate::BOp { fast, len: 2, careful: false, pair_head: false, glue: false };
-        let m = compile::<NoBus>(&[(0, 0x0200_0000, vec![bop])], &mem, false);
+        let m = compile::<NoBus>(&[(0, 0x0200_0000, vec![bop])], &mem, false, false);
         let [r, w, o] = helpers::<NoBus>(false);
         // SAFETY: a plain byte slice; the host copies it before returning
         let f = unsafe { fm1_jit_compile(m.as_ptr(), m.len(), r, w, o) };
@@ -1969,7 +2146,7 @@ pub fn fop_selftest() -> u32 {
             let (b2, b3) = if op <= 6 { (a << 4 | op, d << 4 | b) } else { (op, d << 4 | a) };
             bus.0 = [0; 16];
             bus.0[..4].copy_from_slice(&[0x3f, 0xe5, b2, b3]);
-            let m = compile::<NoBus>(&[(0, 0x0200_0000, vec![bop])], &mem, false);
+            let m = compile::<NoBus>(&[(0, 0x0200_0000, vec![bop])], &mem, false, false);
             let [r, w, o] = helpers::<NoBus>(false);
             // SAFETY: a plain byte slice; the host copies it before returning
             let f = unsafe { fm1_jit_compile(m.as_ptr(), m.len(), r, w, o) };
@@ -2087,9 +2264,10 @@ fn module(body: &[u8]) -> Vec<u8> {
     name(&mut ex, "run");
     ex.extend_from_slice(&[0x00, F_RUN as u8]);
     section(&mut m, 7, &ex);
-    // code: locals a, b, addr, val, off, done, cur (i32), the op result (i64), fa, fb (f32)
+    // code: locals a, b, addr, val, off, done, cur (i32), the op result (i64), fa, fb (f32),
+    // the probe points' stop (i32)
     let mut f = Vec::new();
-    f.extend_from_slice(&[3, 7, T_I32, 1, T_I64, 2, T_F32]);
+    f.extend_from_slice(&[4, 7, T_I32, 1, T_I64, 2, T_F32, 1, T_I32]);
     f.extend_from_slice(body);
     let mut code = Vec::new();
     uleb(&mut code, 1);

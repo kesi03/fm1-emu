@@ -1277,6 +1277,113 @@ registers in wasm locals within a block (+1-5%, within what the rest moves; 5.35
 the same and dropped it), a helper of its own for `sti` (neutral), SRAM2 as a third inline range
 (no gain, 3-6% code-size cost where it is unused). None kept.
 
+## 5.38 FM1_STRICT's tests out of the default run loop (2026-11-02)
+
+The realistic mode of #105 (FM1_STRICT and the CPU's guards, documented in docs/stock-firmware.md) tested `Cpu::cost_model` at four places in `run_fast`'s loop, once
+or twice per instruction, and `Soc::strict_align` before the alignment of every RAM read and
+write; both off, the default emulator paid for the tests. Against master before #105 (CPU seconds,
+interleaved, median of 5): interpreted zen and Melodee +31%, the browser build 3-6% slower, the
+native JIT 0-4%. The loop is generic over `COST` now as it is over `STRETCH` (5.33), the four
+tests `if COST`, `run_fast` / `run_stretch` picking the copy from `cost_model` once per call; the
+alignment tests test the address first, so an aligned access never loads the flag. Interpreted:
++31% -> +16-21%; the browser build back within noise; the JIT +2% (zp12 +4%).
+
+What is left of the interpreter's gap is not the per-block PC-limit check (`pc_enter`: 1-2%,
+measured with it taken out) nor the flash cache's test on XIP reads (0-3%); the rest of #105's
+per-block additions (`cpu0_between`'s guard and exception bookkeeping, `any_pending`'s extra
+field) are each a few instructions, and the `Cpu` and `Soc` structs grew. A native profile of
+the two builds side by side is the way to find it; the catalog check (interpreted, every
+firmware) is where it costs time, users run the JIT.
+
+## 5.39 Melodee 1.6.0's resource region: a package that is not the whole install (open, 2026-11-02)
+
+Found filming the 0.4.0 release: the page booted Melodee 1.6.0 (on the Hub since 2026-11-02) to
+**Setup unfinished / Factory sounds missing / Install the update again**, where 1.4.5 boots to its
+PROPHET screen. 1.6.0 moved its factory sounds, the Rubik font and the Bluetooth radio program out of
+the application into a **resource region** of data flash, `0xCB000`-`0xDFFFF` (21 sectors, up to
+the OTA staging; `firmware/src/res.c`), read in place through XIP: a 32-byte header at `0xCB000`
+(magic `MRS1`, payload length, the payload's CRC-32, a header CRC written last as the commit record)
+and the payload from `0xCB020`. The region is **not in the package**: it is a file of its own,
+`melodee-1.6.0-res.bin` (53,876 bytes: the header, then the payload) among the GitHub release's
+assets, which the web installer fetches beside the package and writes through **editor command 82**
+over the editor's connection (`web/fm1res.js`: status `[0]`, begin `[1]` erases the region after
+moving old preset banks out, 256-byte chunks, verify). The Hub serves the package only
+(`fw/melodee-1.6.0-res.bin`: 404). Booted from its package alone, as every package boots here
+(docs/stock-firmware.md), the region is erased and the firmware asks for the update again. Older
+Melodee kept preset banks in that range, which is why the firmware moves them first.
+
+So "boots from its package, byte-identical" is no longer the whole install for every firmware: a
+firmware may need files its installer writes afterwards. Melodee is the first; the SMK-37's USR
+bank (5.34's layout) was the nearest thing before, solved by a bank of our own.
+
+What to do (not done):
+
+1. **fm1-live / fm1-emu:** `--res FILE[@ADDR]` (or a general `--flash-write ADDR FILE`): lay the
+   file into the flash image at `0xCB000` before the boot. Laid verbatim, the file is an installed
+   region (the header first, as `res.c` checks it: magic, length, CRC-32 of what follows).
+2. **The page:** the catalog entry names the resource file and its address (`"res": {"url", "at"}`),
+   fetched as the package is (from the author's release: CORS to check; the Hub does not mirror it)
+   and laid over the flash at boot, kept with the save as the package is. `?flash=` already lays
+   sectors over a try-out's flash, so a sector file made once from the installed region is the
+   quick way for fm1-dock-style try-outs.
+3. **The honest alternative,** the installer's path: feed command 82 with the file through the
+   emulated USB (fm1-live `--usb`, or a `FM1_BENCH_KEYS` `mHEX` script), which also tests Melodee's
+   `res_begin` / write / verify and the preset-bank migration. Worth doing once as a test; too slow
+   for every boot (the write is 256 bytes a round trip).
+4. **The catalog:** the Hub tool marks Bubba Machine "boots to a black screen" from before
+   jamminstein's fix, and the page's list (95) is behind the Hub's (148): refresh it, and when
+   Melodee moves to 1.6.0 there, its entry needs 2.
+
+Not a regression of 0.4.0: the page's catalog still pins `melodee-1.4.5.fwsc`, which runs; the
+1.6.0 package reached that page through `fetchPackage`'s fallback to the Hub's current package,
+taken when the pinned download fails (it failed once that evening, not again). 1.4.5 is the
+film's Melodee.
+## 5.40 A played note's delay: the plugin's lead as a setting (2026-11-04)
+
+A user of 0.4.0: "the trigger latency is still longer than 20 ms, including Mac AU plugin and
+browser". Where a note played live spends its time, at 44.1 kHz:
+
+- The plugin (AU and VST3 alike): the machine's thread runs one host block plus 1024 frames
+  ahead of the host (`lead`, crates/fm1-plugin/src/engine.rs), and a note from the host or the
+  window is taken at the frame that far ahead. With a 512-frame host buffer that is 35 ms, plus
+  the host's own output block, 12 ms, plus the firmware's. The plugin reports the lead as its
+  latency and the host makes up for it, but only for notes the host places itself; a played one
+  hears all of it.
+- The page: keys and MIDI go to the worklet as they happen and are applied at once, with the
+  machine up to one DMA half buffer ahead of the audio clock (5.29's pace: 0 for Felucca and
+  the stock firmware, 5.8 or 11.6 ms for the firmwares with 256- or 512-frame halves), plus
+  the AudioContext's output (`?latency=interactive`, a few ms on macOS).
+- The firmware itself, its key scan and DMA half, as on the device. Measured headless at
+  240 MHz (fm1-live --bench, FM1_BENCH_KEYS, a MIDI note or a key at a known ms to the first
+  sample off the level before it, so a slow attack counts): Felucca 6.4 / 7.6 ms (MIDI / key),
+  Melodee 7.2 / 7.6, Golana 3.6 / 4.7, Caravel 4.2 / 5.4, MC-1 3.6 / 33.8, FOMAJAM 38 / 40,
+  386DX 46 / 54, CS-1 46 / 63; AMB and DUB hundreds of ms, their pads' attacks.
+
+So the plugin's fixed 1024 frames (23 ms) were the largest single piece under our control.
+It is now a setting, "Lead" in the window and a host parameter (`lead`, non-automatable):
+23 ms as before (the default, so projects play as they did), 12 ms or 6 ms. Changing it sends
+the machine's thread the new lead and tells the host the new latency (`set_latency_samples`
+from `process`). A lead that is too short for the emulation's uneven pace shows as "frames
+late" in the status bar, which is the user's cue to go back up. The machine's thread reads the
+parameter every round (the host's block it is told once); the latency report goes through
+nih-plug's CLAP wrapper, which while processing asks the host for a restart, and clap-wrapper's
+AU side does nothing on that request, so an AU host keeps the old latency for its sequenced
+notes until the plugin is loaded again (VST3 and CLAP hosts take it at once). Shrinking the
+lead while playing also leaves the frames already rendered at the old lead in the ring for one
+old lead's time, during which stamped notes are taken as they come: a hiccup of under 20 ms,
+once per change. With a 128-frame host buffer
+and the 6 ms lead a Felucca note sounds about 20 ms after the key: 9 ms lead and block, 3 ms
+the host's block, 7 ms Felucca's own, plus the driver.
+
+Not done, in the order it would pay:
+- A measured number on the status bar: the lead in ms, plus the host's block, so the user sees
+  what the setting does instead of a name.
+- The page: a note is applied where the machine is, up to a half buffer ahead; stamping it to
+  the frame the audio clock is at would cost that half buffer back, but the machine has
+  already rendered past it. Only a smaller pace (`?ahead=256` exists) helps, at 5.29's cost.
+- The device's own figure for comparison: the probes of [harbor-probes] could time a MIDI note
+  to the DAC on the chip. Without it, the firmware column above is the emulator's word.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

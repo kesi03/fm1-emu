@@ -204,6 +204,10 @@ pub struct AddrHasher(u64);
 
 /// SFR words at aligned addresses below this live in `Soc::sfr_lo`.
 const SFR_LO_END: u32 = 0x6_0000;
+/// PLL0's two control words (JL_ANA), and what they read once a bootloader started it.
+const PLL0_CON0: u32 = 0x119a0;
+const PLL0_CON1: u32 = 0x119a4;
+const PLL0_BOOT: (u32, u32) = (0x4540_0203, 0x3f50_3026);
 
 impl std::hash::Hasher for AddrHasher {
     fn finish(&self) -> u64 {
@@ -217,6 +221,13 @@ impl std::hash::Hasher for AddrHasher {
     fn write_u32(&mut self, v: u32) {
         self.0 = (v as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
+}
+
+/// What a core spins on (`Soc::waits`): the cores' hardware lock, or a byte lock at this address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wait {
+    Lock,
+    Byte(u32),
 }
 
 /// The board around the chip: the FM-1's panel, or the SMK-37's (SMK-37 Pro / Elite, MKE-P37
@@ -344,6 +355,15 @@ pub struct Soc {
     rand: u64,
     /// The cores' hardware lock (`lockset` / `lockclr`): which core holds it.
     lock_owner: Option<u32>,
+    /// core 1 runs beside cpu0 (`machine::run_dual`): a core that finds a lock held then waits
+    /// for the other (`waits`), which the runner hands the machine to. Not set by a runner
+    /// that steps the cores itself (fm1-emu's), nor while cpu0 runs alone.
+    pub cpu1_running: bool,
+    /// What each core spins on, with `cpu1_running`: the hardware lock the other core holds
+    /// (`lockset` denied) or a byte lock it found taken (`testset`). Set by the instruction,
+    /// taken by the runner that acts on it (`machine::run_dual`, `run_cpu1`): the core's next
+    /// try sets it again or not.
+    pub waits: [Option<Wait>; 2],
     /// FM1_GPIO_TRACE: GPIO register writes by address (debugging port use).
     pub gpio_writes: Option<std::collections::BTreeMap<u32, u64>>,
     unknown_log: Vec<UnknownAccess>,
@@ -483,7 +503,7 @@ impl Soc {
 
     /// `ram_size` in bytes; `xip` = the app binary mapped at XIP_BASE.
     pub fn new(ram_size: usize, xip: Vec<u8>) -> Self {
-        Self {
+        let mut soc = Self {
             board: Board::Fm1,
             bt_window: BT_WINDOW_BASE,
             xip,
@@ -509,6 +529,8 @@ impl Soc {
             sfr: Default::default(),
             paused: [false; 2],
             lock_owner: None,
+            cpu1_running: false,
+            waits: [None; 2],
             crc: 0,
             rand: 0x9e37_79b9_7f4a_7c15,
             cpu1_release: false,
@@ -535,7 +557,14 @@ impl Soc {
             resets: 0,
             reset_req: None,
             boot: None,
-        }
+        };
+        // PLL0 as the bootloader leaves it, M-VAVE's and m-bootloader's alike (read off FM-1s:
+        // felucca-bsp chip/fm1_clock.h). The BSP's audio driver (AMB-1 1.3.2, CTL-1 1.0.3,
+        // CHOPPAH 0.99, Polly 0.6.2) checks these before it starts ALNK0 and leaves the audio
+        // off under any other clock. `take_boot` keeps them for a reset.
+        soc.sfr_set(PLL0_CON0, PLL0_BOOT.0);
+        soc.sfr_set(PLL0_CON1, PLL0_BOOT.1);
+        soc
     }
 
     /// cpu0 starts (the runners call this before its first instruction): the chip as it is now
@@ -586,6 +615,7 @@ impl Soc {
         self.usb.keep_recording(&mut old); // (a computer's recording goes on across the reset)
         (self.paused, self.lock_owner, self.cpu1_release, self.cpu1_released_once, self.crc) = ([false; 2], None, false, false, 0);
         (self.cpu1_idle, self.cpu1_fault) = (false, None);
+        (self.cpu1_running, self.waits) = (false, [None; 2]);
         self.flash.chip_reset();
         cpu.set_plain_state(&boot.cpu);
         // the guards as at power-on: no causes, no PC limits (the restored SFRs hold none; the
@@ -759,6 +789,23 @@ impl Soc {
     /// The highest-priority interrupt pending for core `core` (its own enable bank).
     pub fn pending_irq_for(&self, core: u32) -> Option<(u8, u8)> {
         self.periph.pending_irq_for(core)
+    }
+
+    /// Would `core` still spin on `w` (`waits`): the hardware lock held by the other core, the
+    /// byte lock not yet cleared (one outside the RAMs, which no `testset` should see: never
+    /// cleared, so the core waits the slice out rather than retrying it a round at a time)?
+    pub fn still_waits(&self, core: u32, w: Wait) -> bool {
+        match w {
+            Wait::Lock => self.lock_owner.is_some_and(|c| c != core),
+            Wait::Byte(a) => !matches!(self.ram_byte(a), Some(0)),
+        }
+    }
+
+    /// The byte at `a` in one of the RAMs (None: not in one).
+    fn ram_byte(&self, a: u32) -> Option<u8> {
+        [(&self.ram, RAM_BASE), (&self.ovl, OVL_BASE), (&self.sram2, SRAM2_BASE)]
+            .into_iter()
+            .find_map(|(r, base)| a.checked_sub(base).filter(|&o| (o as usize) < r.len()).map(|o| r.read8(o)))
     }
 
     pub fn unknown_accesses(&self) -> &[UnknownAccess] {
@@ -1055,9 +1102,20 @@ impl Bus for Soc {
         }
     }
 
+    fn spin(&mut self, core: u32, addr: u32) {
+        if self.cpu1_running {
+            self.waits[core as usize & 1] = Some(Wait::Byte(addr));
+        }
+    }
+
     fn hw_lock(&mut self, core: u32, set: bool) -> bool {
         match (set, self.lock_owner) {
-            (true, Some(c)) if c != core => false,
+            (true, Some(c)) if c != core => {
+                if self.cpu1_running {
+                    self.waits[core as usize & 1] = Some(Wait::Lock);
+                }
+                false
+            }
             (true, _) => {
                 self.lock_owner = Some(core);
                 true
@@ -1122,7 +1180,7 @@ impl Bus for Soc {
 
     #[inline(always)]
     fn read16(&mut self, addr: u32) -> u16 {
-        if self.strict_align && addr & 1 != 0 && (addr.wrapping_sub(RAM_BASE) as usize) < self.ram.len() {
+        if addr & 1 != 0 && self.strict_align && (addr.wrapping_sub(RAM_BASE) as usize) < self.ram.len() {
             self.misaligned(addr, 2);
         }
         // halfwords sit at offsets 0 and 2 of the word (the old `>> 8` for
@@ -1135,7 +1193,7 @@ impl Bus for Soc {
     fn read32(&mut self, addr: u32) -> u32 {
         let o = addr.wrapping_sub(RAM_BASE) as usize;
         if o + 4 <= self.ram.len() {
-            if self.strict_align && addr & 3 != 0 {
+            if addr & 3 != 0 && self.strict_align {
                 self.misaligned(addr, 4);
             }
             return self.ram.read32(o as u32);
@@ -1187,7 +1245,7 @@ impl Bus for Soc {
 
     #[inline(always)]
     fn write16(&mut self, addr: u32, value: u16) {
-        if self.strict_align && addr & 1 != 0 && (addr.wrapping_sub(RAM_BASE) as usize) < self.ram.len() {
+        if addr & 1 != 0 && self.strict_align && (addr.wrapping_sub(RAM_BASE) as usize) < self.ram.len() {
             self.misaligned(addr, 2);
         }
         // merged at (addr & 2) within the aligned word, as the slow path does
@@ -1202,7 +1260,7 @@ impl Bus for Soc {
     fn write32(&mut self, addr: u32, value: u32) {
         let o = addr.wrapping_sub(RAM_BASE) as usize;
         if o + 4 <= self.ram.len() {
-            if self.strict_align && addr & 3 != 0 {
+            if addr & 3 != 0 && self.strict_align {
                 self.misaligned(addr, 4);
             }
             return self.ram.write32(o as u32, value);
@@ -1753,6 +1811,17 @@ mod tests {
         assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the erase after the cut never happened");
         assert_eq!(soc.flash.ops, 3);
         assert!(soc.flash.cut());
+    }
+
+    #[test]
+    fn pll0_reads_as_the_bootloader_left_it() {
+        // felucca-bsp's audio driver: ALNK0 starts only under this clock (fm1_clock.h)
+        let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
+        assert_eq!(soc.read32(0x119a0), 0x4540_0203);
+        assert_eq!(soc.read32(0x119a4) & 0x07ff_ffff, 0x0750_3026);
+        // still a plain register: what the firmware writes reads back
+        soc.write32(0x119a0, 0x4540_0200);
+        assert_eq!(soc.read32(0x119a0), 0x4540_0200);
     }
 
     /// A chip with IRQ 16 enabled in cpu0's bank and SPI1 at the LCD's BAUD.
